@@ -5,6 +5,7 @@
 #include <esp32_smartdisplay.h>
 #include <DatabaseOnSD.h>
 #include <WiFi.h>
+#include "esp_task_wdt.h"
 
 #include "myUtils.hpp"
 #include "uiFiles/ui.h"
@@ -63,6 +64,7 @@ void uiTask(void *parameters)
 
     while (1)
     {
+        esp_task_wdt_reset();
         now = millis();
 
         // check for inactivity

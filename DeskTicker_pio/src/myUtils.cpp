@@ -170,6 +170,49 @@ SemaphoreHandle_t SDmutex = NULL;
 const char *htmlFilePath = "/index.htm";
 const char *tickerListFilePath = "/tickerList.csv";
 
+// Robust function to initialize the SD card
+bool initSDCard(int maxRetries)
+{
+    ESP_LOGI("myUtils.cpp", "Initializing SD card...");
+
+    // delay for power stabilization
+    delay(200);
+
+    for (int attempt = 1; attempt <= maxRetries; attempt++)
+    {
+        if (attempt > 1)
+        {
+            delay(500 * attempt);
+        }
+
+        // initialize SD card. Can lower clock speed if needed for reliability try 1 MHz (default is 4 MHz)
+        if (SD.begin(5, SPI, 4000000))
+        {
+            ESP_LOGI("myUtils.cpp", "SD card initialized successfully on attempt %d", attempt);
+
+            // Verify can actually access the card
+            uint64_t cardSize = SD.totalBytes();
+            if (cardSize > 0)
+            {
+                ESP_LOGI("myUtils.cpp", "SD card verified. Size: %llu bytes", cardSize);
+                return true;
+            }
+            else
+            {
+                ESP_LOGW("myUtils.cpp", "SD card mounted but size is 0, retrying...");
+                SD.end();
+                continue;
+            }
+        }
+
+        ESP_LOGW("myUtils.cpp", "SD card initialization attempt %d failed", attempt);
+        SD.end();
+    }
+
+    ESP_LOGE("myUtils.cpp", "SD card initialization failed after %d attempts", maxRetries);
+    return false;
+}
+
 // Function to return a list of all files in the SD card
 String listDir(fs::FS &fs, const char *dirname)
 {
@@ -267,6 +310,7 @@ void printSdUssage(void)
 /*****************************  Data Utils  ****************************/
 /***********************************************************************/
 SemaphoreHandle_t TickListmutex = NULL;
+SemaphoreHandle_t Clientmutex = NULL;
 const ushort maxTickers = 30;
 const ushort tickerListColNum = 3;
 bool updateTickerList = false;

@@ -3,6 +3,7 @@
 #include <WiFi.h>
 #include <SD.h>
 #include <ESP32Time.h>
+#include "esp_task_wdt.h"
 
 #include "myUtils.hpp"
 #include "ui.hpp"
@@ -21,6 +22,9 @@ void setup()
 {
   Serial.begin(115200);
   Serial.println("Booting...");
+
+  // Power stabilization delay for SD card
+  delay(1000);
 
   // create mutexes
   prefsmutex = xSemaphoreCreateMutex();
@@ -43,25 +47,31 @@ void setup()
   {
     xSemaphoreGive(logmutex);
   }
+  Clientmutex = xSemaphoreCreateMutex();
+  if (Clientmutex != NULL)
+  {
+    xSemaphoreGive(Clientmutex);
+  }
 
   // set log levels and callback
-  esp_log_level_set("*", ESP_LOG_INFO);
-  /*
-  esp_log_level_set("main.cpp", ESP_LOG_DEBUG);
+  //esp_log_level_set("*", ESP_LOG_INFO);
+  
+  esp_log_level_set("main.cpp", ESP_LOG_INFO);
   esp_log_level_set("data.cpp", ESP_LOG_DEBUG);
-  esp_log_level_set("web.cpp", ESP_LOG_DEBUG);
-  esp_log_level_set("ui.cpp", ESP_LOG_DEBUG);
-  esp_log_level_set("myUtils.cpp", ESP_LOG_DEBUG);
-  */
+  esp_log_level_set("web.cpp", ESP_LOG_INFO);
+  esp_log_level_set("ui.cpp", ESP_LOG_INFO);
+  esp_log_level_set("myUtils.cpp", ESP_LOG_INFO);
+  
   esp_log_set_vprintf(handleNewLogMessage);
 
   // init SD card
-  if (!SD.begin(5))
+  if (!initSDCard())
   {
-    ESP_LOGE("main.cpp", "Card Mount Failed");
+    ESP_LOGE("main.cpp", "SD Card initialization failed after all attempts");
     reboot();
   }
 
+  delay(200);
   // get the latest log file from SD card
   logFilesInit();
   ESP_LOGI("main.cpp", "***** Booting ***** Current log file %d.txt", logFileNum);
@@ -74,7 +84,7 @@ void setup()
   timeoutTimer = xTimerCreate("Timeout Timer", 6000, pdFALSE, NULL, timeoutReboot);
   xTimerStart(timeoutTimer, 0);
   // get ui settings from NVS
-  xTaskCreatePinnedToCore(settingsInitTask, "settingsTask", 2000, NULL, 1, NULL, 1);
+  xTaskCreatePinnedToCore(settingsInitTask, "settingsTask", 3000, NULL, 1, NULL, 1);
   vTaskDelay(1000);
 
   xTaskCreatePinnedToCore(uiTask, "uiTask", 7168, NULL, 4, &uiTaskHandle, 1);
@@ -86,6 +96,11 @@ void setup()
   xTaskCreatePinnedToCore(dataTask, "dataTask", 6144, NULL, 3, &dataTaskHandle, 1);
   xTaskCreatePinnedToCore(webTask, "webTask", 4096, NULL, 2, &webTaskHandle, 1);
   xTaskCreatePinnedToCore(sysTask, "sysTask", 4096, NULL, 2, &sysTaskHandle, 1);
+
+  // setup watchdog timer
+  esp_task_wdt_init(120, true);
+  esp_task_wdt_add(uiTaskHandle);
+  esp_task_wdt_add(dataTaskHandle);
 }
 
 void loop()

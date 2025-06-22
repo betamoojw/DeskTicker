@@ -47,6 +47,7 @@ extern SemaphoreHandle_t SDmutex;
 extern const char *htmlFilePath;
 extern const char *tickerListFilePath;
 
+bool initSDCard(int maxRetries = 5);
 String listDir(fs::FS &fs, const char *dirname);
 void printSdUssage(void);
 
@@ -54,6 +55,7 @@ void printSdUssage(void);
 /*****************************  Data Utils  ****************************/
 /***********************************************************************/
 extern SemaphoreHandle_t TickListmutex;
+extern SemaphoreHandle_t Clientmutex;
 extern const ushort maxTickers;
 extern ushort numTickers;
 extern const ushort tickerListColNum;

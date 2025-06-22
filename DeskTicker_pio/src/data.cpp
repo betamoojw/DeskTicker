@@ -10,6 +10,7 @@
 #include <DatabaseOnSD.h>
 #include <WiFiClientSecure.h>
 #include <ArduinoJson.h>
+#include "esp_task_wdt.h"
 
 #include "esp_log.h"
 #include "esp32-hal-log.h"
@@ -21,6 +22,8 @@
 static const char *myTAG = "data.cpp";
 
 static const String DATA_DIRECTORY = "/data";
+
+String csvData;
 
 ushort updateInterval = 5; // in minutes
 bool eodUpdate = false;
@@ -38,6 +41,9 @@ const char *userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) Gec
 /***********************************************************************/
 void dataTask(void *parameters)
 {
+    csvData.reserve(1024 * 10); // reserve 10KB for CSV data
+    csvData.clear();
+
     // check if the market is open
     isMarketOpen();
 
@@ -52,19 +58,23 @@ void dataTask(void *parameters)
     // check if csv files are up to date and get todays price
     for (int i = 0; i < numTickers; i++)
     {
+        esp_task_wdt_reset();
         if (!isCsvFileDataUpToDate(tickerList[i].symbol))
         {
             ESP_LOGI(myTAG, "%s.csv is outdated. Updating now...", tickerList[i].symbol);
             updateCsvFile(i);
+            esp_task_wdt_reset();
             vTaskDelay(SC_Request_Delay);
         }
         getTodayData(i);
+        esp_task_wdt_reset();
         vTaskDelay(SC_Request_Delay);
     }
     lastUpdate = millis();
 
     while (1)
     {
+        esp_task_wdt_reset();
         // check if the market is open
         isMarketOpen();
 
@@ -75,6 +85,7 @@ void dataTask(void *parameters)
             dataDirUpdate();
             for (int i = 0; i < numTickers; i++)
             {
+                esp_task_wdt_reset();
                 getTodayData(i);
                 vTaskDelay(SC_Request_Delay);
             }
@@ -96,6 +107,7 @@ void dataTask(void *parameters)
             {
                 for (int i = 0; i < numTickers; i++)
                 {
+                    esp_task_wdt_reset();
                     getTodayData(i);
                     vTaskDelay(SC_Request_Delay);
                 }
@@ -180,17 +192,18 @@ void dataDirUpdate(void)
             {
                 fileExists = true;
                 ESP_LOGD(myTAG, "Found CSV file for symbol: %s", tickerList[i].symbol);
+                entry.close();
                 break;
             }
 
-            entry.close(); // Close the file to avoid memory issues
+            entry.close();
         }
         dir.rewindDirectory();
         if (!fileExists)
         {
             // If no CSV file exists for this symbol, call getData()
             ESP_LOGI(myTAG, "No CSV found for symbol: %s", tickerList[i].symbol);
-            String csvData = "";
+            csvData.clear();
             csvData = getHistoricData(i, priceHistLen);
             if (csvData != "")
             {
@@ -206,6 +219,7 @@ void dataDirUpdate(void)
                     file.close();
                     ESP_LOGI(myTAG, "Data saved to %s/%s.csv", DATA_DIRECTORY, tickerList[i].symbol);
                 }
+                csvData.clear();
             }
             vTaskDelay(SC_Request_Delay); // Delay to avoid sending too many requests at once
         }
@@ -244,30 +258,36 @@ String getHistoricData(const int tickerNum, const int length)
     bool success = false;
     String symbol = tickerList[tickerNum].symbol;
     ESP_LOGV(myTAG, "Downloading data for %s, length = %d", symbol, length);
-    String csvData = "";
     for (int j = 0; j < 2; j++)
     {
+        esp_task_wdt_reset();
         if (j > 0)
         {
-            ESP_LOGW(myTAG, "Attempt %d failed to get todays price for %s", j, symbol);
+            ESP_LOGW(myTAG, "Attempt %d failed to get historic data for %s", j, symbol);
             ESP_LOGD(myTAG, "Waiting %ds before retry...", SC_Request_Delay * j / 1000);
         }
         vTaskDelay(SC_Request_Delay * j);
-        WiFiClientSecure client;
-        client.setInsecure();
-        client.setTimeout(30);
-        if (!client.connect(scURLBase, 443))
+        xSemaphoreTake(Clientmutex, portMAX_DELAY);
+        WiFiClientSecure localClient;
+        localClient.setInsecure();
+        localClient.setTimeout(30);
+        localClient.setHandshakeTimeout(20);
+        localClient.connect(scURLBase, 443);
+        vTaskDelay(150);
+        if (!localClient.connected())
         {
             char err_buf[100];
-            if (client.lastError(err_buf, 100) < 0)
+            int error_code = localClient.lastError(err_buf, 100);
+            if (error_code < 0)
             {
-                ESP_LOGW(myTAG, "SC connect failed: %s", err_buf);
+                ESP_LOGW(myTAG, "SC connect failed: %d - %s", error_code, err_buf);
             }
             else
             {
                 ESP_LOGW(myTAG, "SC connection error");
             }
-            client.stop();
+            localClient.stop();
+            xSemaphoreGive(Clientmutex);
             continue;
         }
 
@@ -278,45 +298,62 @@ String getHistoricData(const int tickerNum, const int length)
         String request = String("GET ") + scHistURLPath + queryParams + " HTTP/1.0\r\n" +
                          "Host: " + scURLBase + "\r\n" +
                          "User-Agent: " + userAgent + "\r\n" +
+                         "Accept: application/json, text/plain, */*\r\n" +
+                         "Accept-Encoding: identity\r\n" +
                          "Connection: close\r\n\r\n";
 
         // Send the request
-        client.print(request);
+        localClient.print(request);
 
-        // Use to print out headers
-        while (client.connected() || client.available())
+        // Wait for response
+        while (localClient.connected() && !localClient.available())
         {
-            if (client.available())
+            vTaskDelay(25);
+        }
+
+        // read and validate HTTP status line
+        String statusLine = localClient.readStringUntil('\n');
+        if (!statusLine.startsWith("HTTP/1.1 2"))
+        {
+            ESP_LOGW(myTAG, "HTTP Error: %s", statusLine.c_str());
+            Serial.println(statusLine);
+            localClient.stop();
+            xSemaphoreGive(Clientmutex);
+            continue;
+        }
+        ESP_LOGD(myTAG, "Historical Attempt: %d, Ticker: %s, HTTP Status: %s", j, symbol, statusLine.c_str());
+
+        // header parsing
+        bool headersComplete = false;
+        while (localClient.connected() && !headersComplete)
+        {
+            if (localClient.available())
             {
-                String line = client.readStringUntil('\n');
+                String line = localClient.readStringUntil('\n');
                 if (PRINT_HEADERS)
                 {
                     Serial.println(line);
                 }
-                if (line == "\r")
+                line.trim(); // Remove whitespace/carriage returns
+                if (line.length() == 0)
                 {
-                    // Headers received, break to read body
-                    break;
+                    headersComplete = true;
                 }
+            }
+            else
+            {
+                delay(15);
             }
         }
 
-        /*
-        // Print HTTP status
-        char status[32] = {0};
-        client.readBytesUntil('\r', status, sizeof(status));
-        Serial.print("Status: ");
-        Serial.println(status);
-
-        // Skip HTTP headers
-        char endOfHeaders[] = "\r\n\r\n";
-        if (!client.find(endOfHeaders))
+        // check if data is available
+        if (!localClient.available())
         {
-            Serial.println(F("Invalid response"));
-            client.stop();
+            ESP_LOGW(myTAG, "No response body available");
+            localClient.stop();
+            xSemaphoreGive(Clientmutex);
             continue;
         }
-        */
 
         // Create a filter to extract the desired fields
         JsonDocument filter;
@@ -324,9 +361,10 @@ String getHistoricData(const int tickerNum, const int length)
         filter["intervals"][0]["close"] = true;
         // Parse the JSON response
         JsonDocument doc;
-        DeserializationError error = deserializeJson(doc, client, DeserializationOption::Filter(filter));
+        DeserializationError error = deserializeJson(doc, localClient, DeserializationOption::Filter(filter));
 
-        client.stop();
+        localClient.stop();
+        xSemaphoreGive(Clientmutex);
 
         if (error)
         {
@@ -337,6 +375,7 @@ String getHistoricData(const int tickerNum, const int length)
         // serializeJsonPretty(doc, Serial);
 
         // parse data to CSV
+        csvData.clear();
         csvData += "Date,Close\n";
         JsonArray intervals = doc["intervals"];
         for (JsonObject interval : intervals)
@@ -370,29 +409,36 @@ void getTodayData(const int tickerNum)
     bool success = false;
     xSemaphoreTake(TickListmutex, portMAX_DELAY);
     ESP_LOGV(myTAG, "Getting todays price for %s", tickerList[tickerNum].symbol);
-    for (int j = 0; j < 2; j++)
+    for (int jj = 0; jj < 2; jj++)
     {
-        if (j > 0)
+        esp_task_wdt_reset();
+        if (jj > 0)
         {
-            ESP_LOGW(myTAG, "Attempt %d to get todays price for %s failed", j + 1, tickerList[tickerNum].symbol);
-            ESP_LOGD(myTAG, "Waiting %ds before retry...", SC_Request_Delay * j / 1000);
+            ESP_LOGW(myTAG, "Attempt %d to get todays price for %s failed", jj, tickerList[tickerNum].symbol);
+            ESP_LOGD(myTAG, "Waiting %ds before retry...", SC_Request_Delay * jj / 1000);
         }
-        vTaskDelay(SC_Request_Delay * j);
-        WiFiClientSecure client;
-        client.setInsecure();
-        client.setTimeout(30);
-        if (!client.connect(scURLBase, 443))
+        vTaskDelay(SC_Request_Delay * jj);
+        xSemaphoreTake(Clientmutex, portMAX_DELAY);
+        WiFiClientSecure localClient2;
+        localClient2.setInsecure();
+        localClient2.setTimeout(30);
+        localClient2.setHandshakeTimeout(20);
+        localClient2.connect(scURLBase, 443);
+        vTaskDelay(150);
+        if (!localClient2.connected())
         {
             char err_buf[100];
-            if (client.lastError(err_buf, 100) < 0)
+            int error_code = localClient2.lastError(err_buf, 100);
+            if (error_code < 0)
             {
-                ESP_LOGW(myTAG, "SC connect failed: %s", err_buf);
+                ESP_LOGW(myTAG, "SC connect failed: %d - %s", error_code, err_buf);
             }
             else
             {
                 ESP_LOGW(myTAG, "SC connection error");
             }
-            client.stop();
+            localClient2.stop();
+            xSemaphoreGive(Clientmutex);
             continue;
         }
 
@@ -403,45 +449,61 @@ void getTodayData(const int tickerNum)
         String request = String("GET ") + scTodayURLPath + queryParams + " HTTP/1.0\r\n" +
                          "Host: " + scURLBase + "\r\n" +
                          "User-Agent: " + userAgent + "\r\n" +
+                         "Accept: application/json, text/plain, */*\r\n" +
+                         "Accept-Encoding: identity\r\n" +
                          "Connection: close\r\n\r\n";
 
         // Send the request
-        client.print(request);
+        localClient2.print(request);
 
-        // Use to print out headers
-        while (client.connected() || client.available())
+        // Wait for response
+        while (localClient2.connected() && !localClient2.available())
         {
-            if (client.available())
+            vTaskDelay(25);
+        }
+
+        // read and validate HTTP status line
+        String statusLine = localClient2.readStringUntil('\n');
+        if (!statusLine.startsWith("HTTP/1.1 2"))
+        {
+            ESP_LOGW(myTAG, "HTTP Error: %s", statusLine.c_str());
+            localClient2.stop();
+            xSemaphoreGive(Clientmutex);
+            continue;
+        }
+        ESP_LOGD(myTAG, "Today Attempt: %d, Ticker: %s, HTTP Status: %s", jj, tickerList[tickerNum].symbol, statusLine.c_str());
+
+        // header parsing
+        bool headersComplete = false;
+        while (localClient2.connected() && !headersComplete)
+        {
+            if (localClient2.available())
             {
-                String line = client.readStringUntil('\n');
+                String line = localClient2.readStringUntil('\n');
                 if (PRINT_HEADERS)
                 {
                     Serial.println(line);
                 }
-                if (line == "\r")
+                line.trim();
+                if (line.length() == 0)
                 {
-                    // Headers received, break to read body
-                    break;
+                    headersComplete = true; // Empty line indicates end of headers
                 }
+            }
+            else
+            {
+                delay(15);
             }
         }
 
-        /*
-        // Print HTTP status
-        char status[32] = {0};
-        client.readBytesUntil('\r', status, sizeof(status));
-        // Serial.print("Status: ");
-        // Serial.println(status);
-
-        // Skip HTTP headers
-        char endOfHeaders[] = "\r\n\r\n";
-        if (!client.find(endOfHeaders))
+        // check if data is available
+        if (!localClient2.available())
         {
-            Serial.println(F("Invalid response"));
-            client.stop();
+            ESP_LOGW(myTAG, "No response body available");
+            localClient2.stop();
+            xSemaphoreGive(Clientmutex);
             continue;
         }
-        */
 
         // Create a filter to extract the desired fields
         JsonDocument filter;
@@ -449,9 +511,10 @@ void getTodayData(const int tickerNum)
         filter[0]["closeYesterday"] = true;
         // Parse the JSON response
         JsonDocument doc;
-        DeserializationError error = deserializeJson(doc, client, DeserializationOption::Filter(filter));
+        DeserializationError error = deserializeJson(doc, localClient2, DeserializationOption::Filter(filter));
 
-        client.stop();
+        localClient2.stop();
+        xSemaphoreGive(Clientmutex);
 
         if (error)
         {
@@ -555,6 +618,7 @@ void updateAllCsvFiles(void)
     ESP_LOGI(myTAG, "Updating all CSV data files");
     for (int i = 0; i < numTickers; i++)
     {
+        esp_task_wdt_reset();
         updateCsvFile(i);
         vTaskDelay(SC_Request_Delay); // Delay to avoid sending too many requests
     }
@@ -567,7 +631,7 @@ bool updateCsvFile(const int tickerIndex)
 
     String symbol = tickerList[tickerIndex].symbol;
 
-    String csvData = "";
+    csvData.clear();
     ESP_LOGD(myTAG, "Updating %s.csv l=%d", symbol, priceHistLen);
     csvData = getHistoricData(tickerIndex, priceHistLen);
     if (csvData != "")
@@ -585,6 +649,7 @@ bool updateCsvFile(const int tickerIndex)
             ESP_LOGI(myTAG, "Data successfully saved to %s/%s.csv", DATA_DIRECTORY, symbol);
             success = true;
         }
+        csvData.clear();
     }
 
     return success;
